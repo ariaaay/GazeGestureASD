@@ -15,11 +15,21 @@ import torch
 from torch.utils.data._utils.collate import default_collate
 
 from retinaface import RetinaFace
+from deep_sort_pytorch.deep_sort import DeepSort
+import tensorflow as tf
+import gc
+from tensorflow.keras import backend as K
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(device)
-# import tensorflow as tf
-# print("GPUs Available:", tf.config.list_physical_devices('GPU'))
-# print(tf.sysconfig.get_build_info()["cudnn_version"])
+# if torch.cuda.is_available():
+#     device = "cuda:1"
+# # print("GPUs Available:", tf.config.list_physical_devices('GPU'))
+# # print(tf.sysconfig.get_build_info()["cudnn_version"])
+# gpus = tf.config.list_physical_devices('GPU')
+# if gpus:
+#     for gpu in gpus:
+#         tf.config.experimental.set_memory_growth(gpu, True)
+
 
 
 def extract_video_paths(data_folder, session_key):
@@ -106,12 +116,19 @@ def calculate_bbox_distance_to_child_pos(point, bboxes):
         distances.append(distance)
     return distances
 
-
-def visualize_all(pil_image, heatmaps, bboxes, inout_scores, child_pos, inout_thresh=0.5):
-    # bboxes, l2r_order = rearrange_bbox_l2r(bboxes)
-    distances = calculate_bbox_distance_to_child_pos(child_pos, bboxes)
-    child_ind = np.argmin(distances)
-    # heatmaps = heatmaps[l2r_order]
+def visualize_all_with_tracking(pil_image, heatmaps, bboxes, inout_scores, ds_output, child_ids, inout_thresh=0.5):
+    bboxes, l2r_order = rearrange_bbox_l2r(bboxes)
+    heatmaps = heatmaps[l2r_order]
+    ds_output = ds_output[l2r_order]
+    track_ids = np.array(ds_output)[:, -1]
+    
+    if len(bboxes) == 3:
+        child_ind = 1
+    else:
+        for i, tid in enumerate(track_ids):
+            if tid in child_ids:
+                child_ind = i
+        
     colors = ['lime', 'tomato', 'cyan', 'fuchsia', 'yellow']
     overlay_image = pil_image.convert("RGBA")
     draw = ImageDraw.Draw(overlay_image)
@@ -152,6 +169,58 @@ def visualize_all(pil_image, heatmaps, bboxes, inout_scores, child_pos, inout_th
 
     return overlay_image, children_eye_contact_score
 
+def visualize_all(pil_image, heatmaps, bboxes, inout_scores, child_id, inout_thresh=0.5, child_pos=None):
+    bboxes, l2r_order = rearrange_bbox_l2r(bboxes)
+    heatmaps = heatmaps[l2r_order]
+    
+    if len(bboxes) == 3:
+        child_ind = 1
+    else:
+        if child_pos is not None:
+            distances = calculate_bbox_distance_to_child_pos(child_pos, bboxes)
+            child_ind = np.argmin(distances)
+        else:
+            child_ind = -1
+        
+    colors = ['lime', 'tomato', 'cyan', 'fuchsia', 'yellow']
+    overlay_image = pil_image.convert("RGBA")
+    draw = ImageDraw.Draw(overlay_image)
+    width, height = pil_image.size
+    children_eye_contact_score = -1
+    for i in range(len(bboxes)):
+        bbox = bboxes[i]
+        xmin, ymin, xmax, ymax = bbox
+        color = colors[i % len(colors)]
+        draw.rectangle([xmin * width, ymin * height, xmax * width, ymax * height], outline=color, width=int(min(width, height) * 0.01))
+        if i == child_ind:
+            if inout_scores is not None:
+                inout_score = inout_scores[i]
+                other_bboxes = bboxes.copy()
+                other_bboxes.pop(i)
+                eye_contact_scores = detect_eye_contact(heatmaps[i], other_bboxes, width, height, normalize_heatmap=True)
+                if len(eye_contact_scores) > 0:
+                    children_eye_contact_score = max(eye_contact_scores)
+            text = "%.2f" % inout_score + "|" + "%.2f" % children_eye_contact_score
+            # text = "%.2f" % inout_score
+            # text_width = draw.textlength(text)
+            text_height = int(height * 0.01)
+            text_x = xmin * width
+            text_y = ymax * height + text_height
+            draw.text((text_x, text_y), text, fill=color, font=ImageFont.load_default(size=int(min(width, height) * 0.05)))
+
+            if inout_scores is not None and inout_score > inout_thresh:
+                heatmap = heatmaps[i]
+                heatmap_np = heatmap.detach().cpu().numpy()
+                max_index = np.unravel_index(np.argmax(heatmap_np), heatmap_np.shape)
+                gaze_target_x = max_index[1] / heatmap_np.shape[1] * width
+                gaze_target_y = max_index[0] / heatmap_np.shape[0] * height
+                bbox_center_x = ((xmin + xmax) / 2) * width
+                bbox_center_y = ((ymin + ymax) / 2) * height
+
+                draw.ellipse([(gaze_target_x-5, gaze_target_y-5), (gaze_target_x+5, gaze_target_y+5)], fill=color, width=int(0.005*min(width, height)))
+                draw.line([(bbox_center_x, bbox_center_y), (gaze_target_x, gaze_target_y)], fill=color, width=int(0.005*min(width, height)))
+
+    return overlay_image, children_eye_contact_score
 
 def compute_eye_contact_only(pil_image, heatmaps, bboxes, inout_scores, child_pos):
     distances = calculate_bbox_distance_to_child_pos(child_pos, bboxes)
@@ -168,32 +237,9 @@ def compute_eye_contact_only(pil_image, heatmaps, bboxes, inout_scores, child_po
         
     return children_eye_contact_score
 
-# def collate_fn(batch):
-#     print("Collating batch of size:", len(batch))
-#     print(len(batch[0]["inout"]))
-#     print(len(batch[0]["heatmap"]))
-#     print(len(batch[1]["inout"]))
-#     print(len(batch[1]["heatmap"]))
-#     collated = {}
-#     for key in batch[0].keys():
-#         values = [item[key] for item in batch]
-#         try:
-#             collated[key] = default_collate(values)
-#         except RuntimeError:
-#             # fallback to list if stacking fails (e.g., variable lengths)
-#             print(key, "stacking failed, fallback to list")
-#             collated[key] = values
-#     return collated
-
-
-
-def visualize_gaze_in_image(model, transform, images, face_threshold=0.5, batch_size=128):
-    gaze_scores = []
-    overlay_images = []
+def estimate_face_bboxes(images, transform, face_threshold=0.5):
     width, height = images[0].size
-    print("Number of images:", len(images))
-    print("Image size:", width, height)
-    
+    # print("Image size:", width, height)
     norm_bboxes = []
     img_tensors = []
     fail_indexes = []
@@ -206,48 +252,113 @@ def visualize_gaze_in_image(model, transform, images, face_threshold=0.5, batch_
         else:
             img_tensors.append(transform(image).unsqueeze(0).to(device))
             norm_bboxes.append([np.array(bbox) / np.array([width, height, width, height]) for bbox in bboxes])
-        
-    child_pos = cluster_bbox_for_child_pos(norm_bboxes)
-    
-    input = {
-        "images": torch.cat(img_tensors, 0), # [num_images, 3, 448, 448]
-        "bboxes": norm_bboxes # [[img1_bbox1, img1_bbox2...], [img2_bbox1, img2_bbox2]...]
-    }    
-    
+            
+    return img_tensors, norm_bboxes, fail_indexes
+
+def estimate_gaze_in_image(model, transform, images, batch_size=64, face_threshold=0.5):
+    print("Number of images:", len(images))
     # to avoid OOM, we split the input into microbatches
     total_size = len(images)
-    if total_size > batch_size:
-        output_heatmap, output_inout = [], []
-        for i in tqdm(range(0, total_size, batch_size)):
-            microbatch = {
-                "images": input["images"][i:i+batch_size],
-                "bboxes": input["bboxes"][i:i+batch_size]}
-            with torch.no_grad(): 
-                batch_output = model(microbatch)
-            # print(len(batch_output["heatmap"]))
-            # print(len(batch_output["heatmap"][0]))
-            # print(batch_output["heatmap"][0][0])
-            output_heatmap += batch_output["heatmap"]
-            # print(len(output_heatmap))
-            output_inout += batch_output["inout"]
-
-        # output = collate_fn(outputs)
-        output = {
-            "heatmap": output_heatmap,
-            "inout": output_inout
+    output_heatmap, output_inout, all_norm_bboxes = [], [], []
+    
+    for i in tqdm(range(0, total_size, batch_size)):
+        images_batch = images[i:i+batch_size]
+        img_tensors, norm_bboxes, fail_indexes = estimate_face_bboxes(images_batch, transform, face_threshold=face_threshold)
+        input = {
+            "images": torch.cat(img_tensors, 0), # [num_images, 3, 448, 448]
+            "bboxes": norm_bboxes # [[img1_bbox1, img1_bbox2...], [img2_bbox1, img2_bbox2]...]
         }
-    else:
+        
+        # After TF is done:
+        K.clear_session()
+        gc.collect()
+        
         with torch.no_grad():
-            output = model(input)
+            batch_output = model(input)
+    
+        output_heatmap += batch_output["heatmap"]
+        output_inout += batch_output["inout"]
+        all_norm_bboxes += norm_bboxes
+
+    output = {
+        "heatmap": output_heatmap,
+        "inout": output_inout
+    }
+    return images, all_norm_bboxes, output, fail_indexes
+
+def estimate_gaze_in_image_with_tracking(model, transform, images, ds_bboxes, batch_size=64):
+    print("Number of images:", len(images))
+    # to avoid OOM, we split the input into microbatches
+    width, height = images[0].size
+    total_size = len(images)
+    output_heatmap, output_inout, all_norm_bboxes = [], [], []
+    
+    
+    for i in tqdm(range(0, total_size, batch_size)):
+        images_batch = images[i:i+batch_size]
+        ds_bboxes_batch = ds_bboxes[i:i+batch_size]
+        norm_bboxes, img_tensors = [], []
+        for j, bboxes in enumerate(ds_bboxes_batch):
+            if bboxes is None or len(bboxes) == 0:
+                print("No face detected in image %d" % j)
+                fail_indexes.append(j)
+        else:
+            img_tensors.append(transform(images_batch[j]).unsqueeze(0).to(device))
+            norm_bboxes.append([convert_ds_bbox_to_rf_bbox(bbox) / np.array([width, height, width, height]) for bbox in bboxes])
+        
+        input = {
+            "images": torch.cat(img_tensors, 0), # [num_images, 3, 448, 448]
+            "bboxes": norm_bboxes # [[img1_bbox1, img1_bbox2...], [img2_bbox1, img2_bbox2]...]
+        }
+        
+        # After TF is done:
+        K.clear_session()
+        gc.collect()
+        
+        with torch.no_grad():
+            batch_output = model(input)
+    
+        output_heatmap += batch_output["heatmap"]
+        output_inout += batch_output["inout"]
+        all_norm_bboxes += norm_bboxes
+
+    output = {
+        "heatmap": output_heatmap,
+        "inout": output_inout
+    }
+    return images, all_norm_bboxes, output, fail_indexes
+
+def calculate_gaze_score_in_image(images, norm_bboxes, output, fail_indexes, child_pos=None):
+    gaze_scores = []
+    overlay_images = []
     
     k = 0
-    for i, image in enumerate(images):
+    for i, image in enumerate(tqdm(images)):
         if i in fail_indexes:
             overlay_images.append(image)
             gaze_scores.append(-1)
             k+=1
         else:
-            vis, score = visualize_all(image, output['heatmap'][i-k], norm_bboxes[i-k], output['inout'][i-k] if output['inout'][i-k] is not None else None, child_pos, inout_thresh=0.5)
+            vis, score = visualize_all(image, output['heatmap'][i-k], norm_bboxes[i-k], output['inout'][i-k] if output['inout'][i-k] is not None else None, inout_thresh=0.5, child_pos=child_pos if child_pos else None)
+            # vis = visualize_heatmap(image, output['heatmap'][i-k], norm_bboxes[i-k], output['inout'][i-k] if output['inout'][i-k] is not None else None)
+            overlay_images.append(vis)
+            gaze_scores.append(score)
+    
+    return np.array(gaze_scores), overlay_images
+
+def calculate_gaze_score_in_image_with_tracking(images, norm_bboxes, gazelle_output, fail_indexes, ds_outputs):
+    gaze_scores = []
+    overlay_images = []
+    
+    k = 0
+    for i, image in enumerate(tqdm(images)):
+        if i in fail_indexes:
+            overlay_images.append(image)
+            gaze_scores.append(-1)
+            k+=1
+        else:
+            vis, score = visualize_all_with_tracking(image, ds_outputs[i-k], gazelle_output['heatmap'][i-k], norm_bboxes[i-k], gazelle_output['inout'][i-k] if gazelle_output['inout'][i-k] is not None else None, inout_thresh=0.5)
+            # vis = visualize_heatmap(image, output['heatmap'][i-k], norm_bboxes[i-k], output['inout'][i-k] if output['inout'][i-k] is not None else None)
             overlay_images.append(vis)
             gaze_scores.append(score)
     
@@ -309,7 +420,8 @@ def extract_frame_at_time_ranges(video_path, time_ranges):
     for i, time_range in enumerate(time_ranges):
         t_start, t_end = time_range
         if t_end > duration_sec:
-            raise ValueError("Requested time exceeds video duration")
+            print("Requested time exceeds video duration")
+            break
         # Calculate the frame index to extract
         start_frame = int(fps * t_start)
         end_frame = int(fps * t_end)
@@ -327,6 +439,102 @@ def extract_frame_at_time_ranges(video_path, time_ranges):
     cap.release()
     return imgs, np.array(trial_tracker)
 
+def extract_detect_and_track_faces(video_path, time_ranges):
+    all_ds_outputs, all_rf_bboxes, all_images, trial_tracker = [], [], [], []
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise IOError("Cannot open video file")
+    # Get the frames per second (fps)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration_sec = total_frames / fps
+    print(f"Video FPS: {fps}, Total frames: {total_frames}, Duration: {duration_sec:.2f}s")
+    
+    for i, time_range in enumerate(time_ranges):
+        t_start, t_end = time_range
+        if t_end > duration_sec:
+            print("Requested time exceeds video duration")
+            break
+        # Calculate the frame index to extract
+        start_frame = int(fps * t_start)
+        end_frame = int(fps * t_end)
+        # Set the video position to the frame
+        for frame_number in range(start_frame, end_frame):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            all_images.append(convert_frame_to_images(frame))
+            trial_tracker.append(i)
+            # Detect faces with RetinaFace
+            results = RetinaFace.detect_faces(frame)
+            bboxes = []
+            confidences = []
+            
+            for key in results:
+                face = results[key]
+                x1, y1, x2, y2 = face['facial_area']
+                bboxes.append([x1, y1, x2 - x1, y2 - y1])  # xywh format
+                confidences.append(face['score'])
+
+            # Convert to numpy array
+            bboxes = np.array(bboxes)
+            all_rf_bboxes.append(bboxes)
+            confidences = np.array(confidences)
+            features = np.zeros((len(bboxes)))  # dummy embeddings
+
+            # Update Deep SORT tracker
+            outputs, _ = deepsort.update(bboxes, confidences, features, frame)
+            all_ds_outputs.append(outputs)
+
+    cap.release()
+    return all_images, all_rf_bboxes, all_ds_outputs, trial_tracker
+
+def extract_child_ids(all_ds_outputs):
+    # find frame with child and get the track id of middle
+    child_id = []
+    for i, outputs in enumerate(all_ds_outputs):
+        if len(outputs) == 3: # 3 faces
+            outputs = np.array(outputs)
+            order = np.argsort(outputs[:, 0]) # sort bbox by xmin
+            child_id.append(outputs[order[1], -1])
+    
+    child_id = set(child_id)
+    return list(child_id)
+
+def convert_ds_bbox_to_rf_bbox(bbox):
+    xmin, ymin, xmax, ymax = bbox
+    w = xmax - xmin
+    h = ymax - ymin
+    new_box = [xmin+int(w/2), ymin+int(h/2), xmax+int(w/2), ymax+int(h/2)]
+    return new_box, w, h
+
+def draw_both_bbox(image, rf_bboxes, ds_outputs):
+    draw = ImageDraw.Draw(image)
+    
+    for bbox in rf_bboxes:
+        xmin, ymin, width, height = bbox
+        draw.rectangle([xmin, ymin, xmin+width, ymin+height], outline="lime", width=5)
+        
+    for i, out in enumerate(ds_outputs):
+        track_id = out[-1]
+        xmin, ymin, xmax, ymax = out[:4]
+        new_box, _, _ = convert_ds_bbox_to_rf_bbox(out[:4])
+        draw.rectangle(new_box, outline="red", width=2)
+        draw.text((xmin, ymin), f"ID: {track_id}", fill="red")
+        
+    plt.figure()
+    plt.imshow(image)
+    return image
+    # plt.show()
+    
+def load_gaze_model():
+    model, transform = torch.hub.load('fkryan/gazelle', 'gazelle_dinov2_vitl14_inout')
+    model.eval()
+    model.to(device)
+    return model, transform
+
 def code_gaze_label(anns):
     labels = []
     for item in anns:
@@ -335,37 +543,90 @@ def code_gaze_label(anns):
         elif item == "no eye contact":
             labels.append(0)
         else:
-            break
+            continue
     return np.array(labels)
 
-def predict_gaze_from_video(video_list, model, transform, plotting):
+def save_model_output(output_dir, video_file, images, norm_bboxes, output, fail_indexes):
+    name = video_file.split("/")[-1]
+    output_file = os.path.join(output_dir, name.replace(".wmv", "_output.pkl"))
+    with open(output_file, "wb") as f:
+        pickle.dump({
+            "images": images,
+            "norm_bboxes": norm_bboxes,
+            "output": output,
+            "fail_indexes": fail_indexes
+        }, f)
+    print("Saved model output to", output_file)
+    
+def load_model_output(output_dir, video_file):
+    name = video_file.split("/")[-1]
+    output_file = os.path.join(output_dir, name.replace(".wmv", "_output.pkl"))
+    with open(output_file, "rb") as f:
+        data = pickle.load(f)
+    images = data["images"]
+    norm_bboxes = data["norm_bboxes"]
+    output = data["output"]
+    fail_indexes = data["fail_indexes"]
+    print("Loaded model output from", output_file)
+    return images, norm_bboxes, output, fail_indexes
+
+def check_output_exists(output_dir, video_file):
+    name = video_file.split("/")[-1]
+    output_path = os.path.join(output_dir, name.replace(".wmv", "_output.pkl"))
+    return os.path.exists(output_path)
+
+def load_annotation_file(video_file):
+    # extract video name from path
+    annotation_file = video_file.replace("video.wmv", "coding.xlsx")
+    try:
+        anns = pd.read_excel(annotation_file)
+    except FileNotFoundError:
+        try:
+            names = annotation_file.split("/")
+            new_name = names[-1][:4] + names[-1][5:]
+            new_path = "/".join(names[:-1]) + "/" + new_name
+            print(f"trying to load {new_path}")
+            anns = pd.read_excel(new_path)
+        except FileNotFoundError:
+            print("Gaze label not found for %s" % video_file)
+            return None, None, None
+    gaze_label = code_gaze_label(anns["EYE CONTACT"])
+    label_len = len(gaze_label) # get rid of the NaN values
+    if label_len == 0:
+        print("Gaze label length is 0 for %s" % video_file)
+        return None, None, None
+    else:
+        begin_times = anns["Begin Time - ss.msec"][:label_len]
+        end_times = anns["End Time - ss.msec"][:label_len]
+        return gaze_label, begin_times, end_times
+
+def predict_gaze_from_video(video_list, model, transform, output_dir, batch_size=64, plotting=False, cluster_child_pos=False):
     results = []
     for video_file in video_list:
-        print(video_file)
-        # extract video name from path
-        annotation_file = video_file.replace("video.wmv", "coding.xlsx")
-        try:
-            anns = pd.read_excel(annotation_file)
-        except FileNotFoundError:
-            continue
-        gaze_label = code_gaze_label(anns["EYE CONTACT"])
-        label_len = len(gaze_label) # get rid of the NaN values
-        begin_times = anns["Begin Time - ss.msec"][:label_len]
-        end_times = anns["End Time - ss.msec"][:label_len] 
-        imgs, trial_tracker = extract_frame_at_time_ranges(video_file, list(zip(begin_times, end_times)))
         if plotting:
             images_to_plot = []
-        if label_len > 0:
-            gaze_scores, overlay_images = visualize_gaze_in_image(model, transform, imgs)
+            
+        gaze_label, begin_times, end_times = load_annotation_file(video_file)
+        if gaze_label is not None:
+            try:
+                images, norm_bboxes, output, fail_indexes = load_model_output(args.gazelle_output_dir, video_file)
+                _, trial_tracker = extract_frame_at_time_ranges(video_file, list(zip(begin_times, end_times)))
+            except FileNotFoundError:
+                imgs, trial_tracker = extract_frame_at_time_ranges(video_file, list(zip(begin_times, end_times)))
+                images, norm_bboxes, output, fail_indexes = estimate_gaze_in_image(model, transform, imgs, batch_size=batch_size, face_threshold=0.5)
+                save_model_output(output_dir, video_file, images, norm_bboxes, output, fail_indexes)
+            
+            gaze_scores, overlay_images = calculate_gaze_score_in_image(images, norm_bboxes, output, fail_indexes)
             # print(gaze_scores)
             # print(gaze_label)
             # print(trial_tracker)
             assert len(trial_tracker) == len(gaze_scores)
-            seg_score = np.zeros(label_len)
-            for i in range(label_len):
+            seg_score = np.zeros(len(gaze_label))
+            for i in range(len(gaze_label)):
                 trial_ind = trial_tracker == i
                 seg_score[i], j = np.max(gaze_scores[trial_ind]), np.argmax(gaze_scores[trial_ind])
-                images_to_plot.append(np.array(overlay_images)[trial_ind][j])
+                if plotting:
+                    images_to_plot.append(np.array(overlay_images)[trial_ind][j])
             gaze_pred = seg_score > 0.2
             acc = np.mean(gaze_pred == gaze_label)
             specificity = np.sum((gaze_pred == 0) & (gaze_label == 0)) / np.sum(gaze_label == 0)
@@ -373,7 +634,7 @@ def predict_gaze_from_video(video_list, model, transform, plotting):
             results.append((os.path.basename(video_file), acc, specificity, sensitivity))
             print("Accuracy:", acc)
             if plotting:
-                for i in range(label_len):
+                for i in range(len(gaze_label)):
                     plt.figure(figsize=(10,10))
                     plt.imshow(images_to_plot[i])
                     plt.axis('off')
@@ -381,12 +642,49 @@ def predict_gaze_from_video(video_list, model, transform, plotting):
     np.save("output/gaze_accs.npy", results)
     return results
 
+def predict_gaze_from_video_with_tracking(video_list, model, transform, output_dir, batch_size=64, plotting=False):
+    results = []
+    for video_file in video_list:
+        if plotting:
+            images_to_plot = []
+            
+        gaze_label, begin_times, end_times = load_annotation_file(video_file)
+        if gaze_label is not None:
+            all_images, all_rf_bboxes, all_ds_outputs, trial_tracker = extract_detect_and_track_faces(video_file, list(zip(begin_times, end_times)))
+            child_ids = extract_child_ids(all_ds_outputs)
+            images, norm_bboxes, output, fail_indexes = estimate_gaze_in_image_with_tracking(model, transform, all_images, all_rf_bboxes, all_ds_outputs, batch_size=batch_size, face_threshold=0.5)
+            # save_model_output(output_dir, video_file, all_images, norm_bboxes, all_rf_boxes, all_ds_outputs, fail_indexes)
+            gaze_scores, overlay_images = calculate_gaze_score_in_image_with_tracking(images, norm_bboxes, output, fail_indexes, all_ds_outputs)
+            # print(gaze_scores)
+            # print(gaze_label)
+            # print(trial_tracker)
+            assert len(trial_tracker) == len(gaze_scores)
+            seg_score = np.zeros(len(gaze_label))
+            for i in range(len(gaze_label)):
+                trial_ind = trial_tracker == i
+                seg_score[i], j = np.max(gaze_scores[trial_ind]), np.argmax(gaze_scores[trial_ind])
+                if plotting:
+                    images_to_plot.append(np.array(overlay_images)[trial_ind][j])
+            gaze_pred = seg_score > 0.2
+            acc = np.mean(gaze_pred == gaze_label)
+            specificity = np.sum((gaze_pred == 0) & (gaze_label == 0)) / np.sum(gaze_label == 0)
+            sensitivity = np.sum((gaze_pred == 1) & (gaze_label == 1)) / np.sum(gaze_label == 1)
+            results.append((os.path.basename(video_file), acc, specificity, sensitivity))
+            print("Accuracy:", acc)
+            if plotting:
+                for i in range(len(gaze_label)):
+                    plt.figure(figsize=(10,10))
+                    plt.imshow(images_to_plot[i])
+                    plt.axis('off')
+                    plt.savefig(os.path.join("figures", os.path.basename(video_file).replace(".wmv", "_%d.png" % i)), bbox_inches='tight', pad_inches=0)
+    np.save("output/gaze_accs.npy", results)
+    return results
 
 def visualize_gaze_in_whole_video(model, transform, video_file, face_threshold=0.5):
     import matplotlib.animation as animation
 
-    images = extract_all_frames(video_file)
-    _, overlay_images = visualize_gaze_in_image(model, transform, images, face_threshold=face_threshold)
+    images, _ = extract_frame_at_time_ranges(video_file, [[90.00, 120.00]]) # minute 5 to 10
+    _, overlay_images = calculate_gaze_score_in_image(model, transform, images, face_threshold=face_threshold, cluster_child_pos=False)
     
     fig, ax = plt.subplots()
     img_display = ax.imshow(overlay_images[0], animated=True)
@@ -396,11 +694,40 @@ def visualize_gaze_in_whole_video(model, transform, video_file, face_threshold=0
         img_display.set_array(overlay_images[frame])
         return [img_display]
     
-    ani = animation.FuncAnimation(fig, update, frames=len(overlay_images), interval=100, blit=True)
-    ani.save("output/%s_gaze.mp4" % os.path.basename(video_file).replace(".wmv", ""), writer='ffmpeg', fps=30)
+    ani = animation.FuncAnimation(fig, update, frames=len(overlay_images), interval=33.33, blit=True)
+    ani.save("output/%s_gaze_min5.mp4" % os.path.basename(video_file).replace(".wmv", ""), writer='ffmpeg', fps=30, dpi=200)
 
-# video_file = "/Datasets/.Autism_Videos/data/bids/sub-9943/ses-18mo/sub-9943_ses-18mo_measure-CSBS_video.wmv"
-# xlsx_file_path = "/Datasets/.Autism_Videos/data/bids/sub-9943/ses-18mo/sub-9943_ses-18mo_measure-CSBS_coding.xlsx"
+def plot_face_movement(output_dir, video_file):
+    output_name = video_file.split("/")[-1].replace(".wmv", ".png")
+    try:
+        _, norm_bboxes, _, _ = load_model_output(output_dir, video_file)
+    except FileNotFoundError:
+        print("No output file found for %s" % video_file)
+        return
+    all_pos = []            
+    for bboxes in norm_bboxes:
+        bboxes, _ = rearrange_bbox_l2r(bboxes)
+        if len(bboxes) == 3:
+            pos = []
+            for bbox in bboxes: 
+                xmin, ymin, xmax, ymax = bbox
+                bbox_center_x = (xmin + xmax) / 2
+                bbox_center_y = (ymin + ymax) / 2
+                pos.append([bbox_center_x, bbox_center_y])
+            all_pos.append(np.vstack(pos))
+    all_pos = np.array(all_pos) # [frame, person, 2]
+    plt.figure()
+    plt.scatter(all_pos[0, 0, 0], all_pos[0, 0, 1], c='r', marker="x")
+    plt.scatter(all_pos[0, 1, 0], all_pos[0, 1, 1], c='g', marker="x")
+    plt.scatter(all_pos[0, 2, 0], all_pos[0, 2, 1], c='b', marker="x")
+    
+    plt.plot(all_pos[:, 0, 0], all_pos[:, 0, 1], 'r-', label='parent', alpha=0.5)
+    plt.plot(all_pos[:, 1, 0], all_pos[:, 1, 1], 'g-', label='child', alpha=0.5)
+    plt.plot(all_pos[:, 2, 0], all_pos[:, 2, 1], 'b-', label='experimenter', alpha=0.5)
+ 
+   
+    plt.savefig(f"figures/face_movement/{output_name}", dpi=300)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gaze prediction from video")
@@ -408,10 +735,26 @@ if __name__ == "__main__":
     parser.add_argument("--data_folder", type=str, default="/Datasets/.Autism_Videos/data/bids/", help="Path to the data folder")
     parser.add_argument("--session_key", type=str, default="ses-18mo", help="Session key to filter videos")
     parser.add_argument("--video_path", type=str, help="Path to specific video file")
-    parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to process")
+    parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to process")
     parser.add_argument("--output_ann_video_only", action="store_true", help="Output annotation video only")
+    parser.add_argument("--cluster_child_pos", action="store_true", help="Cluster child position for gaze prediction")
+    parser.add_argument("--saving_gaze_heatmap_only", action="store_true", help="Save gaze heatmap only")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for processing images")
+    parser.add_argument("--sample_index", type=int, default=0, help="Sample index for testing")
+    parser.add_argument("--plot_face_movement", action="store_true", help="Plot face movement")
+    parser.add_argument("--recompute_gaze", action="store_true", help="Recompute gaze heatmap")
+    parser.add_argument("--sample_start_index", type=int, default=0, help="Skip x videos")
+    parser.add_argument("--gazelle_output_dir", type=str, default="derivatives/gazelle/", help="Output directory for Gazelle model results")
+    parser.add_argument("--deep_sort", action="store_true", help="Use Deep SORT for tracking")
     args = parser.parse_args()
     data_folder = args.data_folder
+
+
+    # video_file = "/Datasets/.Autism_Videos/data/bids/sub-9943/ses-18mo/sub-9943_ses-18mo_measure-CSBS_video.wmv"
+    # xlsx_file_path = "/Datasets/.Autism_Videos/data/bids/sub-9943/ses-18mo/sub-9943_ses-18mo_measure-CSBS_coding.xlsx"
+    
+    if args.deep_sort:
+        deepsort = DeepSort("deep_sort_pytorch/deep_sort/deep/checkpoint/ckpt.t7")
 
     try:
         video_files = pickle.load(open("output/%s_video_files.pkl" % args.session_key, "rb"))
@@ -421,19 +764,38 @@ if __name__ == "__main__":
                             
     if args.video_path is not None:
         video_list = [args.video_path]
+    elif args.sample_index > 0:
+        video_list = [video_files[args.sample_index]]
     else:
-        video_list = video_files[:args.num_samples] # just a sample for testing
-        
-    # load Gaze-LLE model
-    model, transform = torch.hub.load('fkryan/gazelle', 'gazelle_dinov2_vitl14_inout')
-    model.eval()
-    model.to(device)
-    
+        video_list = video_files[args.sample_start_index:args.num_samples] # just a sample for testing
+            
     if args.output_ann_video_only:
+        model, transform = load_gaze_model()
         for video_file in video_list:
             print(video_file)
             visualize_gaze_in_whole_video(model, transform, video_file, face_threshold=0.5)
-    else:
-        predict_gaze_from_video(video_list, model, transform, plotting=args.plotting)
+    elif args.saving_gaze_heatmap_only:
+        model, transform = load_gaze_model()
+        for video_file in video_list:
+            gaze_label, begin_times, end_times = load_annotation_file(video_file)
+            if gaze_label is not None:
+                if (not check_output_exists(args.gazelle_output_dir, video_file)) or args.recompute_gaze:
+                    print(f"computing {video_file}")
+                    imgs, trial_tracker = extract_frame_at_time_ranges(video_file, list(zip(begin_times, end_times)))
+                    images, norm_bboxes, output, fail_indexes = estimate_gaze_in_image(model, transform, imgs, batch_size=args.batch_size, face_threshold=0.5)
+                    save_model_output(args.gazelle_output_dir, video_file, images, norm_bboxes, output, fail_indexes)
+            else:
+                print("Gaze label length is 0 for %s" % video_file)
+                continue
+    elif args.plot_face_movement:
+        for video_file in video_list:
+            plot_face_movement(args.gazelle_output_dir, video_file)
+    elif args.deep_sort:
+        model, transform = load_gaze_model()
+        predict_gaze_from_video_with_tracking(video_list, model, transform, args.gazelle_output_dir, batch_size=args.batch_size, plotting=args.plotting)
+    else:   
+        model, transform = load_gaze_model()
+        predict_gaze_from_video(video_list, model, transform, args.gazelle_output_dir, batch_size=args.batch_size, plotting=args.plotting, cluster_child_pos=args.cluster_child_pos)
                 
             
+# %%
