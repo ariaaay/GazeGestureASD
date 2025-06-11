@@ -65,7 +65,7 @@ def detect_eye_contact(heatmap, bboxes, width, height, normalize_heatmap):
 
 def rearrange_bbox_l2r(bboxes):
     # rearrange bboxes so it is from left to right on image
-    bboxes = np.array(bboxes)
+    bboxes = bboxes.cpu().numpy() if isinstance(bboxes, torch.Tensor) else np.array(bboxes)
     order = np.argsort(bboxes[:, 0])
     bboxes = bboxes[order]
     return list(bboxes), order
@@ -117,17 +117,23 @@ def calculate_bbox_distance_to_child_pos(point, bboxes):
     return distances
 
 def visualize_all_with_tracking(pil_image, heatmaps, bboxes, inout_scores, ds_output, child_ids, inout_thresh=0.5):
+    # computing gaze for 1 image
+    ds_output = np.array(ds_output)
     bboxes, l2r_order = rearrange_bbox_l2r(bboxes)
     heatmaps = heatmaps[l2r_order]
-    ds_output = ds_output[l2r_order]
-    track_ids = np.array(ds_output)[:, -1]
     
+    child_ind = -1
     if len(bboxes) == 3:
         child_ind = 1
     else:
-        for i, tid in enumerate(track_ids):
-            if tid in child_ids:
-                child_ind = i
+        if len(ds_output) > 0: # TODO: should i worried about cases where len > 3?
+            ds_output = ds_output[l2r_order]
+            track_ids = ds_output[:, -1]
+            for i, tid in enumerate(track_ids):
+                if tid in child_ids:
+                    child_ind = i
+                    # print(len(track_ids))
+                    # print("using tracking IDs, child pos %d" % i)
         
     colors = ['lime', 'tomato', 'cyan', 'fuchsia', 'yellow']
     overlay_image = pil_image.convert("RGBA")
@@ -147,7 +153,7 @@ def visualize_all_with_tracking(pil_image, heatmaps, bboxes, inout_scores, ds_ou
                 eye_contact_scores = detect_eye_contact(heatmaps[i], other_bboxes, width, height, normalize_heatmap=True)
                 if len(eye_contact_scores) > 0:
                     children_eye_contact_score = max(eye_contact_scores)
-            text = "%.2f" % inout_score + "|" + "%.2f" % children_eye_contact_score
+            text = "%.2f" % children_eye_contact_score
             # text = "%.2f" % inout_score
             # text_width = draw.textlength(text)
             text_height = int(height * 0.01)
@@ -166,10 +172,10 @@ def visualize_all_with_tracking(pil_image, heatmaps, bboxes, inout_scores, ds_ou
 
                 draw.ellipse([(gaze_target_x-5, gaze_target_y-5), (gaze_target_x+5, gaze_target_y+5)], fill=color, width=int(0.005*min(width, height)))
                 draw.line([(bbox_center_x, bbox_center_y), (gaze_target_x, gaze_target_y)], fill=color, width=int(0.005*min(width, height)))
-
+    # print(children_eye_contact_score)
     return overlay_image, children_eye_contact_score
 
-def visualize_all(pil_image, heatmaps, bboxes, inout_scores, child_id, inout_thresh=0.5, child_pos=None):
+def visualize_all(pil_image, heatmaps, bboxes, inout_scores, inout_thresh=0.5, child_pos=None):
     bboxes, l2r_order = rearrange_bbox_l2r(bboxes)
     heatmaps = heatmaps[l2r_order]
     
@@ -247,7 +253,7 @@ def estimate_face_bboxes(images, transform, face_threshold=0.5):
         resp = RetinaFace.detect_faces(np.array(image), threshold=face_threshold)
         bboxes = [resp[key]['facial_area'] for key in resp.keys()]
         if bboxes is None or len(bboxes) == 0:
-            print("No face detected in image %d" % i)
+            # print("No face detected in image %d" % i)
             fail_indexes.append(i)
         else:
             img_tensors.append(transform(image).unsqueeze(0).to(device))
@@ -286,34 +292,38 @@ def estimate_gaze_in_image(model, transform, images, batch_size=64, face_thresho
     }
     return images, all_norm_bboxes, output, fail_indexes
 
-def estimate_gaze_in_image_with_tracking(model, transform, images, ds_bboxes, batch_size=64):
+def estimate_gaze_in_image_with_tracking(model, transform, images, ds_outputs, rf_bboxes, batch_size=64):
     print("Number of images:", len(images))
     # to avoid OOM, we split the input into microbatches
     width, height = images[0].size
     total_size = len(images)
-    output_heatmap, output_inout, all_norm_bboxes = [], [], []
+    output_heatmap, output_inout, all_norm_bboxes, fail_indexes = [], [], [], []
     
-    
-    for i in tqdm(range(0, total_size, batch_size)):
+    ds_outputs[0] = [convert_rf_bbox_to_ds_bbox(bbox) for bbox in rf_bboxes[0]] # deep sort doesnt output bbox for the first two frames
+    ds_outputs[1] = [convert_rf_bbox_to_ds_bbox(bbox) for bbox in rf_bboxes[1]] # deep sort doesnt output bbox for the first two frames
+    # print(ds_outputs[:1])
+    # print(ds_outputs[2])
+
+    for i in tqdm(range(0, total_size, batch_size)): # every batch
         images_batch = images[i:i+batch_size]
-        ds_bboxes_batch = ds_bboxes[i:i+batch_size]
+        ds_outputs_batch = ds_outputs[i:i+batch_size]
         norm_bboxes, img_tensors = [], []
-        for j, bboxes in enumerate(ds_bboxes_batch):
-            if bboxes is None or len(bboxes) == 0:
-                print("No face detected in image %d" % j)
-                fail_indexes.append(j)
-        else:
-            img_tensors.append(transform(images_batch[j]).unsqueeze(0).to(device))
-            norm_bboxes.append([convert_ds_bbox_to_rf_bbox(bbox) / np.array([width, height, width, height]) for bbox in bboxes])
+        for j, output in enumerate(ds_outputs_batch): # every image in the batch
+            if len(output) == 0:
+                print("No face detected in image %d" % (j+i))
+                fail_indexes.append(j+i)
+            else:
+                img_tensors.append(transform(images_batch[j]).unsqueeze(0).to(device))
+                norm_bboxes.append([convert_ds_bbox_to_rf_bbox(out[:4]) / np.array([width, height, width, height]) for out in output])
         
         input = {
             "images": torch.cat(img_tensors, 0), # [num_images, 3, 448, 448]
             "bboxes": norm_bboxes # [[img1_bbox1, img1_bbox2...], [img2_bbox1, img2_bbox2]...]
         }
         
-        # After TF is done:
-        K.clear_session()
-        gc.collect()
+        # # After TF is done:
+        # K.clear_session()
+        # gc.collect()
         
         with torch.no_grad():
             batch_output = model(input)
@@ -322,11 +332,11 @@ def estimate_gaze_in_image_with_tracking(model, transform, images, ds_bboxes, ba
         output_inout += batch_output["inout"]
         all_norm_bboxes += norm_bboxes
 
-    output = {
+    gazelle_output = {
         "heatmap": output_heatmap,
         "inout": output_inout
     }
-    return images, all_norm_bboxes, output, fail_indexes
+    return images, all_norm_bboxes, gazelle_output, fail_indexes
 
 def calculate_gaze_score_in_image(images, norm_bboxes, output, fail_indexes, child_pos=None):
     gaze_scores = []
@@ -346,7 +356,7 @@ def calculate_gaze_score_in_image(images, norm_bboxes, output, fail_indexes, chi
     
     return np.array(gaze_scores), overlay_images
 
-def calculate_gaze_score_in_image_with_tracking(images, norm_bboxes, gazelle_output, fail_indexes, ds_outputs):
+def calculate_gaze_score_in_image_with_tracking(images, norm_bboxes, gazelle_output, fail_indexes, ds_outputs, child_ids):
     gaze_scores = []
     overlay_images = []
     
@@ -357,8 +367,7 @@ def calculate_gaze_score_in_image_with_tracking(images, norm_bboxes, gazelle_out
             gaze_scores.append(-1)
             k+=1
         else:
-            vis, score = visualize_all_with_tracking(image, ds_outputs[i-k], gazelle_output['heatmap'][i-k], norm_bboxes[i-k], gazelle_output['inout'][i-k] if gazelle_output['inout'][i-k] is not None else None, inout_thresh=0.5)
-            # vis = visualize_heatmap(image, output['heatmap'][i-k], norm_bboxes[i-k], output['inout'][i-k] if output['inout'][i-k] is not None else None)
+            vis, score = visualize_all_with_tracking(image, gazelle_output['heatmap'][i-k], norm_bboxes[i-k], gazelle_output['inout'][i-k] if gazelle_output['inout'][i-k] is not None else None, ds_outputs[i], child_ids, inout_thresh=0.5)
             overlay_images.append(vis)
             gaze_scores.append(score)
     
@@ -508,7 +517,18 @@ def convert_ds_bbox_to_rf_bbox(bbox):
     w = xmax - xmin
     h = ymax - ymin
     new_box = [xmin+int(w/2), ymin+int(h/2), xmax+int(w/2), ymax+int(h/2)]
-    return new_box, w, h
+    return new_box
+
+def convert_rf_bbox_to_ds_bbox(bbox):
+    # rfbox alrady in xywh format
+    cxmin, cymin, w, h = bbox
+    cxmax = cxmin + w
+    cymax = cymin + h
+    xmin = cxmin - int(w / 2)
+    ymin = cymin - int(h / 2)
+    xmax = cxmax - int(w / 2)
+    ymax = cymax - int(h / 2)
+    return [xmin, ymin, xmax, ymax]
 
 def draw_both_bbox(image, rf_bboxes, ds_outputs):
     draw = ImageDraw.Draw(image)
@@ -520,7 +540,7 @@ def draw_both_bbox(image, rf_bboxes, ds_outputs):
     for i, out in enumerate(ds_outputs):
         track_id = out[-1]
         xmin, ymin, xmax, ymax = out[:4]
-        new_box, _, _ = convert_ds_bbox_to_rf_bbox(out[:4])
+        new_box = convert_ds_bbox_to_rf_bbox(out[:4])
         draw.rectangle(new_box, outline="red", width=2)
         draw.text((xmin, ymin), f"ID: {track_id}", fill="red")
         
@@ -558,6 +578,20 @@ def save_model_output(output_dir, video_file, images, norm_bboxes, output, fail_
         }, f)
     print("Saved model output to", output_file)
     
+def save_model_output_with_tracking(output_dir, video_file, all_images, norm_bboxes, gazelle_output, all_ds_outputs, fail_indexes, trial_tracker):
+    save_name = video_file.split("/")[-1]
+    output_file = os.path.join(output_dir, save_name.replace(".wmv", "_output_with_tracking.pkl"))
+    with open(output_file, "wb") as f:
+        pickle.dump({
+            "images": all_images,
+            "norm_bboxes": norm_bboxes,
+            "gazelle_output": gazelle_output,
+            "fail_indexes": fail_indexes,
+            "all_ds_outputs": all_ds_outputs,
+            "trial_tracker": trial_tracker
+        }, f)
+    print("Saved model output to", output_file)
+    
 def load_model_output(output_dir, video_file):
     name = video_file.split("/")[-1]
     output_file = os.path.join(output_dir, name.replace(".wmv", "_output.pkl"))
@@ -570,9 +604,26 @@ def load_model_output(output_dir, video_file):
     print("Loaded model output from", output_file)
     return images, norm_bboxes, output, fail_indexes
 
-def check_output_exists(output_dir, video_file):
+def load_model_output_with_tracking(output_dir, video_file):
     name = video_file.split("/")[-1]
-    output_path = os.path.join(output_dir, name.replace(".wmv", "_output.pkl"))
+    output_file = os.path.join(output_dir, name.replace(".wmv", "_output_with_tracking.pkl"))
+    with open(output_file, "rb") as f:
+        data = pickle.load(f)
+    all_images = data["images"]
+    norm_bboxes = data["norm_bboxes"]
+    gazelle_output = data["gazelle_output"]
+    all_ds_outputs = data["all_ds_outputs"]
+    fail_indexes = data["fail_indexes"]
+    trial_tracker = data["trial_tracker"]
+    print("Loaded model output from", output_file)
+    return all_images, norm_bboxes, gazelle_output, all_ds_outputs, fail_indexes, trial_tracker
+
+def check_output_exists(output_dir, video_file, tracking=False):
+    name = video_file.split("/")[-1]
+    if tracking:
+        output_path = os.path.join(output_dir, name.replace(".wmv", "_output_with_tracking.pkl"))
+    else: 
+        output_path = os.path.join(output_dir, name.replace(".wmv", "_output.pkl"))
     return os.path.exists(output_path)
 
 def load_annotation_file(video_file):
@@ -600,7 +651,7 @@ def load_annotation_file(video_file):
         end_times = anns["End Time - ss.msec"][:label_len]
         return gaze_label, begin_times, end_times
 
-def predict_gaze_from_video(video_list, model, transform, output_dir, batch_size=64, plotting=False, cluster_child_pos=False):
+def predict_gaze_from_video(video_list, model, transform, output_dir, batch_size=64, plotting=False):
     results = []
     for video_file in video_list:
         if plotting:
@@ -639,45 +690,51 @@ def predict_gaze_from_video(video_list, model, transform, output_dir, batch_size
                     plt.imshow(images_to_plot[i])
                     plt.axis('off')
                     plt.savefig(os.path.join("figures", os.path.basename(video_file).replace(".wmv", "_%d.png" % i)), bbox_inches='tight', pad_inches=0)
-    np.save("output/gaze_accs.npy", results)
+        np.save("output/gaze_accs.npy", results) # save as it goes
     return results
 
 def predict_gaze_from_video_with_tracking(video_list, model, transform, output_dir, batch_size=64, plotting=False):
     results = []
     for video_file in video_list:
-        if plotting:
-            images_to_plot = []
-            
-        gaze_label, begin_times, end_times = load_annotation_file(video_file)
-        if gaze_label is not None:
-            all_images, all_rf_bboxes, all_ds_outputs, trial_tracker = extract_detect_and_track_faces(video_file, list(zip(begin_times, end_times)))
-            child_ids = extract_child_ids(all_ds_outputs)
-            images, norm_bboxes, output, fail_indexes = estimate_gaze_in_image_with_tracking(model, transform, all_images, all_rf_bboxes, all_ds_outputs, batch_size=batch_size, face_threshold=0.5)
-            # save_model_output(output_dir, video_file, all_images, norm_bboxes, all_rf_boxes, all_ds_outputs, fail_indexes)
-            gaze_scores, overlay_images = calculate_gaze_score_in_image_with_tracking(images, norm_bboxes, output, fail_indexes, all_ds_outputs)
-            # print(gaze_scores)
-            # print(gaze_label)
-            # print(trial_tracker)
-            assert len(trial_tracker) == len(gaze_scores)
-            seg_score = np.zeros(len(gaze_label))
-            for i in range(len(gaze_label)):
-                trial_ind = trial_tracker == i
-                seg_score[i], j = np.max(gaze_scores[trial_ind]), np.argmax(gaze_scores[trial_ind])
-                if plotting:
-                    images_to_plot.append(np.array(overlay_images)[trial_ind][j])
-            gaze_pred = seg_score > 0.2
-            acc = np.mean(gaze_pred == gaze_label)
-            specificity = np.sum((gaze_pred == 0) & (gaze_label == 0)) / np.sum(gaze_label == 0)
-            sensitivity = np.sum((gaze_pred == 1) & (gaze_label == 1)) / np.sum(gaze_label == 1)
-            results.append((os.path.basename(video_file), acc, specificity, sensitivity))
-            print("Accuracy:", acc)
+        try:
             if plotting:
+                images_to_plot = []
+                
+            gaze_label, begin_times, end_times = load_annotation_file(video_file)
+            if gaze_label is not None:
+                try:
+                    all_images, norm_bboxes, gazelle_output, all_ds_outputs, fail_indexes, trial_tracker = load_model_output_with_tracking(args.gazelle_output_dir, video_file)
+                    # print(len(all_ds_outputs), len(all_images), len(norm_bboxes), len(gazelle_output['heatmap']), len(gazelle_output['inout']))
+                except FileNotFoundError:
+                    all_images, all_rf_bboxes, all_ds_outputs, trial_tracker = extract_detect_and_track_faces(video_file, list(zip(begin_times, end_times)))
+                    all_images, norm_bboxes, gazelle_output, fail_indexes = estimate_gaze_in_image_with_tracking(model, transform, all_images, all_ds_outputs, all_rf_bboxes, batch_size=batch_size)
+                    save_model_output_with_tracking(output_dir, video_file, all_images, norm_bboxes, gazelle_output, all_ds_outputs, fail_indexes, trial_tracker)
+                
+                child_ids = extract_child_ids(all_ds_outputs)
+                gaze_scores, overlay_images = calculate_gaze_score_in_image_with_tracking(all_images, norm_bboxes, gazelle_output, fail_indexes, all_ds_outputs, child_ids)
+                assert len(trial_tracker) == len(gaze_scores)
+                seg_score = np.zeros(len(gaze_label))
                 for i in range(len(gaze_label)):
-                    plt.figure(figsize=(10,10))
-                    plt.imshow(images_to_plot[i])
-                    plt.axis('off')
-                    plt.savefig(os.path.join("figures", os.path.basename(video_file).replace(".wmv", "_%d.png" % i)), bbox_inches='tight', pad_inches=0)
-    np.save("output/gaze_accs.npy", results)
+                    trial_ind = np.array(trial_tracker) == i
+                    seg_score[i], j = np.max(gaze_scores[trial_ind]), np.argmax(gaze_scores[trial_ind])
+                    if plotting:
+                        images_to_plot += [overlay_images[t] for t in trial_ind]
+                gaze_pred = seg_score > 0.2
+                acc = np.mean(gaze_pred == gaze_label)
+                specificity = np.sum((gaze_pred == 0) & (gaze_label == 0)) / np.sum(gaze_label == 0)
+                sensitivity = np.sum((gaze_pred == 1) & (gaze_label == 1)) / np.sum(gaze_label == 1)
+                results.append((os.path.basename(video_file), acc, specificity, sensitivity))
+                print("Accuracy:", acc)
+                if plotting:
+                    for i in range(len(gaze_label)):
+                        plt.figure(figsize=(10,10))
+                        plt.imshow(images_to_plot[i])
+                        plt.axis('off')
+                        plt.savefig(os.path.join("figures/gaze_with_tracking", os.path.basename(video_file).replace(".wmv", "_%d_%d.png" % (i, gaze_label[i]))), bbox_inches='tight', pad_inches=0)
+            np.save("output/gaze_accs_tracking.npy", results) # save as it goes
+        except IndexError:
+            print("IndexError for video %s, skipping..." % video_file)
+            continue
     return results
 
 def visualize_gaze_in_whole_video(model, transform, video_file, face_threshold=0.5):
@@ -744,7 +801,7 @@ if __name__ == "__main__":
     parser.add_argument("--plot_face_movement", action="store_true", help="Plot face movement")
     parser.add_argument("--recompute_gaze", action="store_true", help="Recompute gaze heatmap")
     parser.add_argument("--sample_start_index", type=int, default=0, help="Skip x videos")
-    parser.add_argument("--gazelle_output_dir", type=str, default="derivatives/gazelle/", help="Output directory for Gazelle model results")
+    parser.add_argument("--gazelle_output_dir", type=str, default="/Datasets/.Autism_Videos/data/derivatives/gazelle/", help="Output directory for Gazelle model results")
     parser.add_argument("--deep_sort", action="store_true", help="Use Deep SORT for tracking")
     args = parser.parse_args()
     data_folder = args.data_folder
@@ -764,7 +821,7 @@ if __name__ == "__main__":
                             
     if args.video_path is not None:
         video_list = [args.video_path]
-    elif args.sample_index > 0:
+    elif args.sample_index > -1:
         video_list = [video_files[args.sample_index]]
     else:
         video_list = video_files[args.sample_start_index:args.num_samples] # just a sample for testing
