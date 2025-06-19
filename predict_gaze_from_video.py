@@ -299,10 +299,10 @@ def estimate_gaze_in_image_with_tracking(model, transform, images, ds_outputs, r
     total_size = len(images)
     output_heatmap, output_inout, all_norm_bboxes, fail_indexes = [], [], [], []
     
-    ds_outputs[0] = [convert_rf_bbox_to_ds_bbox(bbox) for bbox in rf_bboxes[0]] # deep sort doesnt output bbox for the first two frames
-    ds_outputs[1] = [convert_rf_bbox_to_ds_bbox(bbox) for bbox in rf_bboxes[1]] # deep sort doesnt output bbox for the first two frames
-    # print(ds_outputs[:1])
-    # print(ds_outputs[2])
+    # ds_outputs[0] = [convert_rf_bbox_to_ds_bbox(bbox) for bbox in rf_bboxes[0]] # deep sort doesnt output bbox for the first two frames
+    # ds_outputs[1] = [convert_rf_bbox_to_ds_bbox(bbox) for bbox in rf_bboxes[1]] # deep sort doesnt output bbox for the first two frames
+    # # print(ds_outputs[:1])
+    # # print(ds_outputs[2])
 
     for i in tqdm(range(0, total_size, batch_size)): # every batch
         images_batch = images[i:i+batch_size]
@@ -448,7 +448,7 @@ def extract_frame_at_time_ranges(video_path, time_ranges):
     cap.release()
     return imgs, np.array(trial_tracker)
 
-def extract_detect_and_track_faces(video_path, time_ranges):
+def extract_detect_and_track_faces(deepsort_init, video_path, time_ranges):
     all_ds_outputs, all_rf_bboxes, all_images, trial_tracker = [], [], [], []
 
     cap = cv2.VideoCapture(video_path)
@@ -459,8 +459,8 @@ def extract_detect_and_track_faces(video_path, time_ranges):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration_sec = total_frames / fps
     print(f"Video FPS: {fps}, Total frames: {total_frames}, Duration: {duration_sec:.2f}s")
-    
     for i, time_range in enumerate(time_ranges):
+        deepsort = deepsort_init.copy()
         t_start, t_end = time_range
         if t_end > duration_sec:
             print("Requested time exceeds video duration")
@@ -469,13 +469,13 @@ def extract_detect_and_track_faces(video_path, time_ranges):
         start_frame = int(fps * t_start)
         end_frame = int(fps * t_end)
         # Set the video position to the frame
-        for frame_number in range(start_frame, end_frame):
+        fnum = 0
+        for frame_number in range(start_frame-3, end_frame):
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
             ret, frame = cap.read()
             if not ret:
                 break
-            all_images.append(convert_frame_to_images(frame))
-            trial_tracker.append(i)
+                        
             # Detect faces with RetinaFace
             results = RetinaFace.detect_faces(frame)
             bboxes = []
@@ -489,13 +489,17 @@ def extract_detect_and_track_faces(video_path, time_ranges):
 
             # Convert to numpy array
             bboxes = np.array(bboxes)
-            all_rf_bboxes.append(bboxes)
             confidences = np.array(confidences)
-            features = np.zeros((len(bboxes)))  # dummy embeddings
-
+            
             # Update Deep SORT tracker
-            outputs, _ = deepsort.update(bboxes, confidences, features, frame)
-            all_ds_outputs.append(outputs)
+            outputs, _ = deepsort.update(bboxes, confidences, np.zeros((len(bboxes))), frame)
+            if fnum > 2: # skip first two frames which are used used for deepsort
+                all_ds_outputs.append(outputs)
+                all_rf_bboxes.append(bboxes)
+                all_images.append(convert_frame_to_images(frame))
+                trial_tracker.append(i)
+            
+            fnum += 1
 
     cap.release()
     return all_images, all_rf_bboxes, all_ds_outputs, trial_tracker
@@ -530,7 +534,7 @@ def convert_rf_bbox_to_ds_bbox(bbox):
     ymax = cymax - int(h / 2)
     return [xmin, ymin, xmax, ymax]
 
-def draw_both_bbox(image, rf_bboxes, ds_outputs):
+def draw_both_bbox(image, rf_bboxes, ds_outputs, plotting=False):
     draw = ImageDraw.Draw(image)
     
     for bbox in rf_bboxes:
@@ -543,9 +547,10 @@ def draw_both_bbox(image, rf_bboxes, ds_outputs):
         new_box = convert_ds_bbox_to_rf_bbox(out[:4])
         draw.rectangle(new_box, outline="red", width=2)
         draw.text((xmin, ymin), f"ID: {track_id}", fill="red")
-        
-    plt.figure()
-    plt.imshow(image)
+    
+    if plotting:
+        plt.figure()
+        plt.imshow(image)
     return image
     # plt.show()
     
@@ -689,7 +694,7 @@ def predict_gaze_from_video(video_list, model, transform, output_dir, batch_size
                     plt.figure(figsize=(10,10))
                     plt.imshow(images_to_plot[i])
                     plt.axis('off')
-                    plt.savefig(os.path.join("figures", os.path.basename(video_file).replace(".wmv", "_%d.png" % i)), bbox_inches='tight', pad_inches=0)
+                    plt.savefig(os.path.join("figures/gaze_without_tracking", os.path.basename(video_file).replace(".wmv", "_%d.png" % i)), bbox_inches='tight', pad_inches=0)
         np.save("output/gaze_accs.npy", results) # save as it goes
     return results
 
@@ -718,8 +723,9 @@ def predict_gaze_from_video_with_tracking(video_list, model, transform, output_d
                     trial_ind = np.array(trial_tracker) == i
                     seg_score[i], j = np.max(gaze_scores[trial_ind]), np.argmax(gaze_scores[trial_ind])
                     if plotting:
-                        images_to_plot += [overlay_images[t] for t in trial_ind]
-                gaze_pred = seg_score > 0.2
+                        images_in_trial = [overlay_images[t] for t, tr in enumerate(trial_ind) if tr]
+                        images_to_plot.append(images_in_trial[j])
+                gaze_pred = seg_score > 0.35
                 acc = np.mean(gaze_pred == gaze_label)
                 specificity = np.sum((gaze_pred == 0) & (gaze_label == 0)) / np.sum(gaze_label == 0)
                 sensitivity = np.sum((gaze_pred == 1) & (gaze_label == 1)) / np.sum(gaze_label == 1)
@@ -852,7 +858,7 @@ if __name__ == "__main__":
         predict_gaze_from_video_with_tracking(video_list, model, transform, args.gazelle_output_dir, batch_size=args.batch_size, plotting=args.plotting)
     else:   
         model, transform = load_gaze_model()
-        predict_gaze_from_video(video_list, model, transform, args.gazelle_output_dir, batch_size=args.batch_size, plotting=args.plotting, cluster_child_pos=args.cluster_child_pos)
+        predict_gaze_from_video(video_list, model, transform, args.gazelle_output_dir, batch_size=args.batch_size, plotting=args.plotting)
                 
             
 # %%
